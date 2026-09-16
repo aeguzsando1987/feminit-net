@@ -99,7 +99,6 @@ CLAUDE.md
 # Documentación: se queda en local por defecto.
 # Solo se sube al remoto lo que se indique explícitamente (quitar la línea aquí).
 docs/
-README.md
 PROMPT_SETUP_SIMPLE.md
 SETUP_SIMPLE.md
 red_sinosofica_schema.dbml
