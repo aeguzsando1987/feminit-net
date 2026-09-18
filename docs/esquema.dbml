@@ -1,0 +1,873 @@
+// =====================================================================
+//  RED SINOSÓFICA — Esquema clínico multidisciplinario · v2
+//  PostgreSQL 16 · Multi-tenant por esquema (django-tenants)
+//  Pegar en https://dbdiagram.io
+// =====================================================================
+
+Project red_sinosofica_v2 {
+  database_type: 'PostgreSQL'
+  Note: '''
+  # Red Sinosófica — v2 con multi-tenancy
+
+  ## ★ Dos niveles de esquema
+
+  **ESQUEMA `public`** — existe una sola vez en toda la base:
+    planes · organizaciones · dominios · organizacion_uso
+
+  **ESQUEMA `<slug_organizacion>`** — replicado por cada organización:
+    todas las demás tablas.
+
+  Consecuencia clave: **las tablas de tenant NO llevan `organizacion_id`.**
+  El aislamiento lo da el `search_path` de Postgres, fijado por middleware
+  a partir del subdominio del request. Un bug en un queryset no puede
+  filtrar datos de otra organización: esas tablas ni siquiera están
+  visibles en la sesión.
+
+  dbdiagram no modela esquemas, así que aquí aparecen juntas. En la base
+  real viven separadas y **no hay llaves foráneas cruzando esquemas**.
+
+  ## Dos capas de aislamiento
+  | Capa   | Qué separa                          | Mecanismo        |
+  |--------|-------------------------------------|------------------|
+  | Esquema| Una organización de otra            | search_path      |
+  | RLS    | Una profesional de otra, dentro de  | Políticas PG     |
+  |        | la misma organización               | + consentimientos|
+
+  ## Principios
+  1. Núcleo relacional, extensión JSONB.
+  2. El ciclo menstrual es serie temporal, no un campo.
+  3. La consulta es contenedor; los bloques son por especialidad.
+  4. Plantillas versionadas e inmutables.
+  5. Compartimentación por consentimiento y ámbito.
+  6. Append-only clínico (NOM-004-SSA3).
+
+  ## Convenciones
+  - PK uuid con gen_random_uuid(); evita enumeración de pacientes.
+  - timestamptz siempre, UTC.
+  - Borrado lógico vía deleted_at. El expediente no se borra.
+  - Índices GIN sobre columnas JSONB consultables.
+  '''
+}
+
+// =====================================================================
+//  ENUMERACIONES
+// =====================================================================
+
+Enum estado_cita {
+  agendada
+  confirmada
+  en_curso
+  completada
+  cancelada_paciente
+  cancelada_profesional
+  no_asistio
+}
+
+Enum modalidad_cita {
+  presencial
+  videollamada
+  telefonica
+}
+
+Enum fase_ciclo {
+  menstrual
+  folicular
+  ovulatoria
+  lutea
+  indeterminada    // anovulatorio, amenorrea, ciclo irregular
+  no_aplica        // menopausia, histerectomía, anticoncepción continua
+}
+
+Enum estado_menopausico {
+  premenopausia
+  perimenopausia
+  postmenopausia
+  menopausia_quirurgica
+  menopausia_inducida
+  no_aplica
+}
+
+Enum tipo_campo {
+  texto_corto
+  texto_largo
+  numero
+  decimal
+  booleano
+  fecha
+  hora
+  seleccion_unica
+  seleccion_multiple
+  escala
+  archivo
+}
+
+Enum ambito_clinico {
+  general
+  ginecologia
+  obstetricia
+  nutricion
+  psicologia
+  sexologia
+  fitness
+  laboratorio
+  administrativo
+}
+
+Enum estado_consentimiento {
+  activo
+  revocado
+  expirado
+  pendiente
+}
+
+Enum accion_auditoria {
+  lectura
+  creacion
+  actualizacion
+  borrado_logico
+  exportacion
+  intento_denegado
+}
+
+// #####################################################################
+// ##                                                                 ##
+// ##   ESQUEMA  public  — una sola vez en toda la base               ##
+// ##                                                                 ##
+// #####################################################################
+
+Table planes {
+  id                     smallint    [pk, increment]
+  clave                  varchar(30) [unique, not null, note: 'base | ampliado | dedicado']
+  nombre                 text        [not null]
+  max_profesionales      integer     [not null, note: 'Cuenta cuentas HABILITADAS (activa=true), no logins recientes. Predecible para la administradora.']
+  max_almacenamiento_mb  integer     [not null]
+  precio_mxn_mensual     numeric(10,2) [not null]
+  features               jsonb       [not null, default: `'{}'`, note: 'Banderas por plan: constructor_formularios, portal_paciente, dominio_propio, instancia_dedicada']
+  activo                 boolean     [not null, default: true]
+  created_at             timestamptz [not null, default: `now()`]
+
+  Note: '''
+  ★ Los PACIENTES no se limitan por número.
+  Un límite de pacientes incentivaría rechazar atención, lo cual
+  contradice el propósito de una red de apoyo. Si el volumen llega a
+  pesar, el límite correcto es almacenamiento, no personas.
+
+  Reglas de aplicación del límite:
+    - Aviso visible a la administradora al 80%, no error sorpresa al 100%.
+    - Al 100%: se impide crear cuentas nuevas.
+    - Al exceder o ante falta de pago: JAMÁS se bloquea lectura del
+      expediente. Bloquear historias clínicas por cobranza no es opción.
+  '''
+}
+
+Table organizaciones {
+  id                uuid        [pk, default: `gen_random_uuid()`]
+  schema_name       varchar(63) [unique, not null, note: 'Nombre del esquema PostgreSQL. Lo gestiona django-tenants.']
+  slug              varchar(30) [unique, not null, note: '★ PERMANENTE. Aparece en URLs guardadas en favoritos y en correos de recuperación. Validar: minúsculas, letras/números/guión medio. Reservados: admin, api, www, app, staging, dev, mail, static.']
+  nombre            text        [not null]
+  plan_id           smallint    [not null]
+  contacto_email    text        [not null]
+  contacto_telefono text
+  activa            boolean     [not null, default: true]
+  onboarding_at     timestamptz
+  created_at        timestamptz [not null, default: `now()`]
+
+  Note: '''
+  TenantMixin de django-tenants.
+  auto_create_schema = True   → crea el esquema al guardar
+  auto_drop_schema   = False  → ★ nunca borrar un esquema clínico por
+                                accidente al eliminar el registro.
+
+  El alta se hace SIEMPRE por comando, nunca con pasos manuales:
+    manage.py crear_organizacion --nombre "..." --slug ... --plan base
+  Si crear una organización toma una tarde de configuración manual,
+  ese es el techo de crecimiento del negocio.
+  '''
+}
+
+Table dominios {
+  id              uuid        [pk, default: `gen_random_uuid()`]
+  dominio         varchar(253) [unique, not null, note: 'redsinosofica.tudominio.mx']
+  organizacion_id uuid        [not null]
+  es_primario     boolean     [not null, default: true]
+  created_at      timestamptz [not null, default: `now()`]
+
+  indexes { organizacion_id }
+
+  Note: '''
+  DomainMixin. El middleware resuelve el tenant leyendo el Host del
+  request contra esta tabla, y fija el search_path.
+
+  Soporta varios dominios por organización, lo que habilita el upsell
+  de dominio propio (sistema.suorganizacion.mx) como feature de plan
+  superior: se agrega un renglón y ellos apuntan un CNAME.
+
+  Límite de Cloudflare a considerar: el SSL universal cubre
+  tudominio.mx y *.tudominio.mx, pero NO *.*.tudominio.mx.
+  Mantener subdominios de un solo nivel.
+  '''
+}
+
+Table organizacion_uso {
+  organizacion_id        uuid        [pk]
+  profesionales_activas  integer     [not null, default: 0]
+  pacientes_total        integer     [not null, default: 0]
+  consultas_total        integer     [not null, default: 0]
+  almacenamiento_mb      numeric(12,2) [not null, default: 0]
+  ultimo_acceso_at       timestamptz
+  actualizado_at         timestamptz [not null, default: `now()`]
+
+  Note: 'Contadores cacheados, recalculados por job periódico. Evita contar sobre esquemas de tenant en cada request. Nunca es la fuente de verdad para bloquear: el conteo autoritativo se hace en el momento de crear.'
+}
+
+Ref: organizaciones.plan_id       > planes.id
+Ref: dominios.organizacion_id     > organizaciones.id [delete: cascade]
+Ref: organizacion_uso.organizacion_id - organizaciones.id [delete: cascade]
+
+// #####################################################################
+// ##                                                                 ##
+// ##   ESQUEMA  <slug>  — replicado por cada organización            ##
+// ##   Sin columna organizacion_id: lo aísla el search_path          ##
+// ##                                                                 ##
+// #####################################################################
+
+// ---------------------------------------------------------------------
+//  0. AUTENTICACIÓN  (una tabla de usuarios POR ESQUEMA)
+// ---------------------------------------------------------------------
+
+Table usuarios {
+  id              uuid        [pk, default: `gen_random_uuid()`, note: '★ UUID, NO entero autoincremental. Ver nota.']
+  email           text        [unique, not null, note: 'USERNAME_FIELD. citext. Unicidad es POR ESQUEMA: la misma persona puede tener cuenta en dos organizaciones con el mismo correo.']
+  password        text        [not null, note: 'Hash de Django']
+  is_active       boolean     [not null, default: true]
+  is_staff        boolean     [not null, default: false]
+  is_superuser    boolean     [not null, default: false]
+  last_login      timestamptz
+  date_joined     timestamptz [not null, default: `now()`]
+
+  Note: '''
+  ★★ AUTH_USER_MODEL personalizado. Debe existir ANTES del primer
+  migrate: cambiar el modelo de usuario después es de las migraciones
+  más dolorosas de Django.
+
+  ## Por qué UUID y no el entero de auth_user
+
+  auth_user usa PK entero autoincremental POR ESQUEMA. El usuario id=5
+  existe en `redsinosofica` y también en `colectivaflor`, y son personas
+  distintas.
+
+  Un JWT que dice "soy el usuario 5", presentado contra el subdominio de
+  OTRA organización, autenticaría como una persona completamente
+  diferente: el middleware resuelve el tenant por Host, busca id=5 en
+  ese esquema, lo encuentra, y lo deja pasar.
+
+  Con UUID, un id de un esquema simplemente no existe en otro.
+
+  ## Segunda medida, obligatoria además del UUID
+
+  Claim de tenant en el token, validado contra el Host del request:
+
+    token["tenant"] = connection.schema_name
+    # y rechazar si token["tenant"] != connection.schema_name
+
+  ## Notas de operación
+  - Sin campo `username`: no aporta nada aquí.
+  - django_session también es por esquema. Login en una organización
+    no da sesión en otra.
+  - Tablas de django-otp (MFA) viven en TENANT_APPS, junto a esta.
+  - El login siempre ocurre dentro de un subdominio. No existe pantalla
+    genérica que pregunte de qué organización eres: lo dice la URL.
+  - Recuperación de contraseña: URL construida desde connection.tenant,
+    NUNCA desde un SITE_URL fijo en settings.
+  - El esquema public tiene su propia tabla de usuarios: ahí vive la
+    cuenta del proveedor para admin.tudominio.mx, detrás de Access.
+  '''
+}
+
+// ---------------------------------------------------------------------
+//  1. PROFESIONALES Y ESPECIALIDADES  (perfiles híbridos M2M)
+// ---------------------------------------------------------------------
+
+Table profesionales {
+  id                uuid        [pk, default: `gen_random_uuid()`]
+  usuario_id        uuid        [unique, not null, note: 'FK a usuarios del MISMO esquema. Credenciales en usuarios, perfil aquí.']
+  nombre            text        [not null]
+  apellidos         text        [not null]
+  nombre_publico    text        [note: 'Cómo aparece ante las pacientes']
+  email             text        [unique, not null, note: 'Usar tipo citext']
+  telefono          text
+  pronombres        text
+  bio               text
+  foto_url          text
+  es_administradora boolean     [not null, default: false, note: 'Puede dar de alta y baja profesionales sin intervención del proveedor']
+  mfa_habilitado    boolean     [not null, default: false]
+  activa            boolean     [not null, default: true, note: '★ Este campo define el consumo del plan. Desactivar libera el lugar; el expediente se conserva.']
+  ultimo_acceso_at  timestamptz
+  created_at        timestamptz [not null, default: `now()`]
+  updated_at        timestamptz [not null, default: `now()`]
+  deleted_at        timestamptz
+
+  indexes {
+    (activa, deleted_at) [note: 'Conteo para el límite de plan']
+  }
+
+  Note: 'MFA obligatoria antes de otorgar acceso a expedientes.'
+}
+
+Table especialidades {
+  id                smallint    [pk, increment]
+  clave             varchar(40) [unique, not null, note: 'ginecologia, nutricion, psicologia, sexologia, fitness, medicina_general']
+  nombre            text        [not null]
+  descripcion       text
+  ambito            ambito_clinico [not null, note: '★ Define la granularidad del consentimiento']
+  requiere_cedula   boolean     [not null, default: true]
+  esquema_metricas  jsonb       [note: 'JSON Schema de las métricas FIJAS. Valida consulta_bloques.metricas_especialidad y autogenera el formulario base.']
+  orden_ui          smallint    [default: 0]
+
+  Note: 'Catálogo sembrado por el comando crear_organizacion. Cada organización puede ajustar el suyo sin afectar a las demás.'
+}
+
+Table profesionales_especialidades {
+  profesional_id     uuid        [not null]
+  especialidad_id    smallint    [not null]
+  cedula_profesional varchar(30) [note: 'Cédula SEP o equivalente']
+  institucion        text
+  es_principal       boolean     [not null, default: false]
+  verificada_at      timestamptz [note: 'NULL = certificación aún no validada por la Red']
+  verificada_por     uuid
+  created_at         timestamptz [not null, default: `now()`]
+
+  indexes {
+    (profesional_id, especialidad_id) [pk]
+    especialidad_id
+  }
+
+  Note: '''
+  ★ Tabla puente que habilita los perfiles híbridos.
+  Una profesional con Fitness + Nutrición tiene dos renglones y puede
+  abrir bloques de ambas especialidades en la misma consulta.
+  El backend valida que consulta_bloques.especialidad_id exista aquí
+  para la profesional que captura.
+  '''
+}
+
+// ---------------------------------------------------------------------
+//  2. PACIENTES  (identidad separada de lo clínico)
+// ---------------------------------------------------------------------
+
+Table pacientes {
+  id                  uuid        [pk, default: `gen_random_uuid()`]
+  folio               varchar(20) [unique, not null]
+  usuario_id          uuid        [unique, note: 'NULL hasta que active su portal — etapa 2']
+
+  nombre_legal        text        [not null]
+  apellidos_legal     text        [not null]
+  nombre_preferido    text        [note: 'Cómo desea ser nombrada; prevalece en toda la UI']
+  fecha_nacimiento    date        [not null]
+  curp                char(18)    [unique, note: '★ Candidato a cifrado con pgcrypto']
+
+  email               text        [note: 'citext']
+  telefono            text        [note: '★ Candidato a cifrado']
+  contacto_emergencia jsonb       [note: '{ nombre, parentesco, telefono, puede_recibir_info }']
+  domicilio           jsonb       [note: '★ Candidato a cifrado']
+
+  ocupacion           text
+  contexto_social     jsonb       [note: 'Red de apoyo, situación de cuidados, acceso a servicios, factores psicosociales. Estructura libre para no imponer categorías.']
+
+  notas_administrativas text     [note: 'NUNCA información clínica. Legible por rol administrativo.']
+  activa              boolean     [not null, default: true]
+  created_at          timestamptz [not null, default: `now()`]
+  updated_at          timestamptz [not null, default: `now()`]
+  deleted_at          timestamptz
+
+  indexes {
+    folio
+    (apellidos_legal, nombre_legal)
+    fecha_nacimiento
+  }
+
+  Note: '''
+  Concentra los datos identificables. Las tablas clínicas referencian
+  solo paciente_id, de modo que una fuga parcial no vincule identidad
+  con contenido clínico.
+
+  Cifrar solo 3-4 columnas, no el expediente completo: una columna
+  cifrada no se indexa ni se busca por contenido.
+  '''
+}
+
+Table antecedentes_generales {
+  paciente_id             uuid        [pk]
+  tipo_sangre             varchar(5)
+  alergias                jsonb       [note: '[{ sustancia, tipo, severidad, reaccion }]']
+  padecimientos_cronicos  jsonb       [note: '[{ cie10, nombre, dx_fecha, estado, tratamiento_actual }]']
+  cirugias                jsonb
+  medicacion_actual       jsonb       [note: '[{ farmaco, dosis, frecuencia, via, desde, prescrita_por }]']
+  antecedentes_familiares jsonb       [note: 'Relevante para riesgo de cáncer de mama y ovario']
+  habitos                 jsonb       [note: '{ tabaco, alcohol, sustancias, actividad_fisica, sueno_horas }']
+  discapacidades          jsonb
+  updated_at              timestamptz [not null, default: `now()`]
+
+  Note: 'JSONB en lugar de N tablas hijas: son listas que se leen completas. Índice GIN si se necesita buscar por alergia o CIE-10.'
+}
+
+// ---------------------------------------------------------------------
+//  3. NÚCLEO DE SALUD DE LA MUJER CIS
+// ---------------------------------------------------------------------
+
+Table antecedentes_ginecobstetricos {
+  paciente_id            uuid        [pk]
+
+  menarca_edad           smallint
+  ciclo_duracion_dias    smallint    [note: 'Promedio habitual']
+  sangrado_duracion_dias smallint
+  ciclo_regular          boolean
+  fum                    date        [note: 'Última menstruación. Actualizada por trigger desde registros_ciclo.']
+
+  gestas                 smallint    [default: 0]
+  partos                 smallint    [default: 0]
+  cesareas               smallint    [default: 0]
+  abortos                smallint    [default: 0]
+  hijas_vivas            smallint    [default: 0]
+  lactancia_actual       boolean     [default: false]
+  detalle_embarazos      jsonb       [note: '[{ anio, desenlace, semanas, complicaciones, lactancia_meses }]']
+
+  metodo_anticonceptivo  jsonb       [note: '{ metodo, desde, marca, dosis, efectos_adversos[] }']
+  estado_menopausico     estado_menopausico [default: 'premenopausia']
+  menopausia_fecha       date
+  terapia_hormonal       jsonb
+
+  ultimo_papanicolaou    date
+  ultimo_vph             date
+  ultima_mastografia     date
+  ultima_densitometria   date
+  resultados_tamizaje    jsonb       [note: '[{ estudio, fecha, resultado, seguimiento_requerido }]']
+
+  updated_at             timestamptz [not null, default: `now()`]
+
+  Note: '''
+  Separada de antecedentes_generales porque su ámbito de acceso es
+  distinto: una entrenadora necesita el estado menopáusico y la fase
+  del ciclo, pero no la historia obstétrica completa.
+  RLS a nivel columna o vistas por ámbito.
+  '''
+}
+
+Table registros_ciclo {
+  id                  bigint      [pk, increment]
+  paciente_id         uuid        [not null]
+  fecha               date        [not null]
+  dia_ciclo           smallint    [note: 'Día 1 = primer día de sangrado']
+  fase                fase_ciclo  [not null, default: 'indeterminada']
+  sangrado_intensidad smallint    [note: '0 ninguno · 1 manchado · 2 ligero · 3 moderado · 4 abundante']
+  dolor_intensidad    smallint    [note: 'EVA 0-10']
+  temperatura_basal   numeric(3,1)
+  moco_cervical       varchar(20)
+  sintomas            jsonb       [note: '{ animo, energia, sueno_calidad, hinchazon, cefalea, libido, antojos, sensibilidad_mamaria }']
+  notas               text
+  origen              varchar(20) [note: 'autorregistro | consulta | wearable']
+  created_at          timestamptz [not null, default: `now()`]
+
+  indexes {
+    (paciente_id, fecha) [unique]
+    fecha
+    fase
+  }
+
+  Note: '''
+  ★★ Tabla clave del enfoque de salud de la mujer cis.
+
+  Como serie temporal independiente, CUALQUIER métrica de CUALQUIER
+  especialidad se cruza con la fase del ciclo:
+
+    SELECT cb.metricas_especialidad->>"press_banca_1rm", rc.fase
+    FROM consulta_bloques cb
+    JOIN consultas c ON c.id = cb.consulta_id
+    JOIN registros_ciclo rc
+      ON rc.paciente_id = c.paciente_id AND rc.fecha = c.fecha::date;
+
+  Esto permite que la entrenadora periodice cargas por fase y que la
+  psicóloga distinga disforia premenstrual de un cuadro depresivo.
+  Enterrado en un JSONB de ginecología, queda inaccesible justo para
+  quienes más lo necesitan.
+
+  El cálculo de fase debe devolver INDETERMINADA o NO_APLICA en vez de
+  inventar un día de ciclo. Un sistema que asume 28 días regulares le
+  falla a una parte importante de las pacientes, y falla en silencio.
+  '''
+}
+
+// ---------------------------------------------------------------------
+//  4. PLANTILLAS Y CAMPOS PERSONALIZADOS  (sin migraciones)
+// ---------------------------------------------------------------------
+
+Table plantillas_formulario {
+  id                uuid        [pk, default: `gen_random_uuid()`]
+  profesional_id    uuid        [not null]
+  especialidad_id   smallint    [note: 'NULL = plantilla transversal']
+  nombre            text        [not null]
+  descripcion       text
+  es_publica        boolean     [not null, default: false, note: 'Compartible dentro de la organización']
+  es_default        boolean     [not null, default: false, note: 'Se precarga al abrir un bloque de esta especialidad']
+  version_actual_id uuid
+  archivada         boolean     [not null, default: false]
+  created_at        timestamptz [not null, default: `now()`]
+
+  indexes { (profesional_id, especialidad_id) }
+
+  Note: 'Etapa 1: se siembran por migración, una por especialidad. Las profesionales tienen formularios funcionando, simplemente no los editan todavía. El constructor visual es etapa 2 y no toca el backend.'
+}
+
+Table plantilla_versiones {
+  id            uuid        [pk, default: `gen_random_uuid()`]
+  plantilla_id  uuid        [not null]
+  version       integer     [not null]
+  definicion    jsonb       [not null, note: 'Snapshot inmutable del arreglo completo de campos. Duplica campos_definicion a propósito.']
+  publicada_at  timestamptz [not null, default: `now()`]
+  publicada_por uuid
+
+  indexes { (plantilla_id, version) [unique] }
+
+  Note: '''
+  ★ INMUTABLE. Nunca se hace UPDATE aquí.
+
+  Cada consulta_bloque apunta a la versión con la que se capturó, de
+  modo que editar el formulario hoy no reinterpreta una consulta de
+  hace ocho meses. Sin esto, el expediente pierde trazabilidad.
+
+  REGLA: una vez publicada una versión, `clave` y `tipo` de un campo NO
+  se pueden cambiar. Se crea campo nuevo y se deprecia el viejo.
+  Cambiar de texto a número no convierte las capturas anteriores.
+  '''
+}
+
+Table campos_definicion {
+  id            uuid        [pk, default: `gen_random_uuid()`]
+  plantilla_id  uuid        [not null]
+  clave         varchar(60) [not null, note: 'Llave dentro de campos_custom_usuario. snake_case, inmutable tras publicar.']
+  etiqueta      text        [not null]
+  ayuda         text
+  tipo          tipo_campo  [not null]
+  unidad        varchar(20) [note: 'kg, cm, mmHg, ng/mL, puntos']
+  opciones      jsonb       [note: '[{ valor, etiqueta }] para selección única/múltiple']
+  validacion    jsonb       [note: '{ requerido, min, max, regex, decimales }']
+  valor_default jsonb
+  graficable    boolean     [not null, default: false, note: 'Si true, aparece en la línea de tiempo de la paciente']
+  orden         smallint    [not null, default: 0]
+  seccion       text
+  deprecado     boolean     [not null, default: false]
+  created_at    timestamptz [not null, default: `now()`]
+
+  indexes {
+    (plantilla_id, clave) [unique]
+    plantilla_id
+  }
+
+  Note: '''
+  ★ El patrón: DEFINICIONES relacionales, VALORES en JSONB. Permite:
+    - renderizar el formulario sin tocar el backend,
+    - validar la captura contra reglas declaradas,
+    - graficar series históricas de un campo inventado por la usuaria,
+    - saber qué significa cada llave dentro del JSONB.
+  Crear un campo nuevo es un INSERT, no una migración.
+
+  Validación adicional en base con jsonb_matches_schema (pg_jsonschema).
+  Sin ella, en un año hay basura con typos en las llaves.
+  '''
+}
+
+// ---------------------------------------------------------------------
+//  5. AGENDA Y CONSULTAS
+// ---------------------------------------------------------------------
+
+Table citas {
+  id                      uuid          [pk, default: `gen_random_uuid()`]
+  paciente_id             uuid          [not null]
+  profesional_id          uuid          [not null]
+  especialidad_id         smallint      [note: 'Con la que se agendó; la consulta puede cubrir más']
+  inicio                  timestamptz   [not null]
+  fin                     timestamptz   [not null]
+  modalidad               modalidad_cita [not null, default: 'presencial']
+  estado                  estado_cita   [not null, default: 'agendada']
+  motivo                  text
+  enlace_virtual          text
+  costo                   numeric(10,2)
+  notas_agenda            text          [note: 'Administrativo, no clínico']
+  recordatorio_enviado_at timestamptz   [note: 'Etapa 2']
+  created_at              timestamptz   [not null, default: `now()`]
+  updated_at              timestamptz   [not null, default: `now()`]
+  deleted_at              timestamptz
+
+  indexes {
+    (profesional_id, inicio)
+    (paciente_id, inicio)
+    estado
+  }
+
+  Note: 'Agregar constraint EXCLUDE con tstzrange para impedir traslapes por profesional.'
+}
+
+Table consultas {
+  id                     uuid        [pk, default: `gen_random_uuid()`]
+  cita_id                uuid        [unique, note: 'NULL si fue atención no agendada']
+  paciente_id            uuid        [not null]
+  profesional_id         uuid        [not null, note: 'Quien encabeza la consulta']
+  fecha                  timestamptz [not null, default: `now()`]
+  duracion_minutos       smallint
+
+  motivo_consulta        text
+  subjetivo              text        [note: 'S — lo que refiere la paciente, en sus palabras']
+  objetivo               text        [note: 'O — hallazgos observados y medidos']
+  analisis               text        [note: 'A — impresión clínica']
+  plan                   text        [note: 'P — plan de manejo']
+
+  signos_vitales         jsonb       [note: '{ ta_sistolica, ta_diastolica, fc, fr, temp, spo2, peso_kg, talla_cm }']
+  fase_ciclo_registrada  fase_ciclo  [note: 'Denormalizada desde registros_ciclo: congela el contexto biológico de la nota']
+  dia_ciclo_registrado   smallint
+
+  proxima_cita_sugerida  date
+  requiere_interconsulta boolean     [default: false]
+  finalizada_at          timestamptz [note: 'Al firmarse, el contenido pasa a ser inmutable']
+  enmienda_de_id         uuid        [note: 'Si esta consulta corrige otra, apunta a la original']
+  created_at             timestamptz [not null, default: `now()`]
+  updated_at             timestamptz [not null, default: `now()`]
+  deleted_at             timestamptz
+
+  indexes {
+    (paciente_id, fecha)
+    (profesional_id, fecha)
+  }
+
+  Note: '''
+  Contenedor de la sesión. Solo lo común a todas las especialidades.
+  Tras finalizada_at, las correcciones se hacen mediante notas de
+  enmienda vinculadas, nunca con UPDATE (NOM-004-SSA3).
+  '''
+}
+
+Table consulta_bloques {
+  id                    uuid        [pk, default: `gen_random_uuid()`]
+  consulta_id           uuid        [not null]
+  especialidad_id       smallint    [not null]
+  profesional_id        uuid        [not null, note: 'Permite sesiones conjuntas entre dos profesionales']
+  plantilla_version_id  uuid        [note: 'Versión exacta del formulario usado']
+
+  metricas_especialidad jsonb       [not null, default: `'{}'`, note: '★ Métricas FIJAS de la especialidad, validadas contra especialidades.esquema_metricas']
+  campos_custom_usuario jsonb       [not null, default: `'{}'`, note: '★ Campos inventados por la profesional. Llaves = campos_definicion.clave']
+
+  notas_bloque          text
+  confidencial          boolean     [not null, default: false, note: 'Solo la autora y quien tenga consentimiento explícito del ámbito']
+  orden                 smallint    [default: 0]
+  created_at            timestamptz [not null, default: `now()`]
+  updated_at            timestamptz [not null, default: `now()`]
+
+  indexes {
+    consulta_id
+    (especialidad_id, created_at)
+    metricas_especialidad [type: gin]
+    campos_custom_usuario [type: gin]
+  }
+
+  Note: '''
+  ★★ Pieza central del diseño interdisciplinario.
+
+  Una sesión de Fitness + Nutrición genera DOS renglones aquí.
+  Frente a un único JSONB en consultas, esto permite:
+    - métricas atribuidas a su disciplina y filtrables,
+    - consentimiento y confidencialidad por ámbito,
+    - dos profesionales capturando en la misma sesión,
+    - graficar "peso en el tiempo" sin adivinar dónde vive el dato.
+
+  Los índices GIN permiten consultar dentro del JSONB sin escaneo:
+    WHERE campos_custom_usuario @> "{\\"adherencia_semanal\\":\\"parcial\\"}"
+  '''
+}
+
+// ---------------------------------------------------------------------
+//  6. PRIVACIDAD: CONSENTIMIENTO Y AUDITORÍA
+// ---------------------------------------------------------------------
+
+Table consentimientos_acceso {
+  id             uuid        [pk, default: `gen_random_uuid()`]
+  paciente_id    uuid        [not null]
+  profesional_id uuid        [not null]
+  ambito         ambito_clinico [not null]
+  puede_leer     boolean     [not null, default: true]
+  puede_escribir boolean     [not null, default: false]
+  estado         estado_consentimiento [not null, default: 'pendiente']
+  otorgado_at    timestamptz
+  vigente_hasta  timestamptz [note: 'NULL = sin expiración; recomendable acotar']
+  revocado_at    timestamptz
+  evidencia      jsonb       [note: '{ metodo: firma_digital|verbal_registrado, hash, ip, timestamp }']
+  created_at     timestamptz [not null, default: `now()`]
+
+  indexes {
+    (paciente_id, profesional_id, ambito) [unique]
+    profesional_id
+    estado
+  }
+
+  Note: '''
+  ★★ Control real de privacidad DENTRO de una organización.
+  El esquema aísla organizaciones entre sí; esta tabla aísla
+  profesionales entre sí. Ambas capas son necesarias.
+
+  RLS (funciona igual en Postgres autohospedado, no requiere Supabase):
+
+    CREATE POLICY lectura_bloques ON consulta_bloques FOR SELECT
+    USING (EXISTS (
+      SELECT 1 FROM consentimientos_acceso ca
+      JOIN consultas c      ON c.id = consulta_bloques.consulta_id
+      JOIN especialidades e ON e.id = consulta_bloques.especialidad_id
+      WHERE ca.paciente_id    = c.paciente_id
+        AND ca.profesional_id = current_setting("app.profesional_id")::uuid
+        AND ca.ambito  = e.ambito
+        AND ca.estado  = "activo"
+        AND ca.puede_leer
+        AND (ca.vigente_hasta IS NULL OR ca.vigente_hasta > now())
+    ));
+
+  El middleware fija app.profesional_id por request con set_config().
+  Con pgbouncer, usar modo transaction.
+
+  La paciente debe poder revocar desde su portal, sin intermediarias.
+  '''
+}
+
+Table auditoria {
+  id                bigint      [pk, increment]
+  actor_id          uuid
+  actor_tipo        varchar(20) [note: 'profesional | paciente | sistema']
+  accion            accion_auditoria [not null]
+  tabla             varchar(60) [not null]
+  registro_id       uuid
+  paciente_afectado uuid        [note: 'Permite a la paciente ver quién consultó su expediente']
+  diff              jsonb       [note: 'Solo actualizaciones. NUNCA valores de campos cifrados.']
+  ip                inet
+  user_agent        text
+  ocurrido_at       timestamptz [not null, default: `now()`]
+
+  indexes {
+    (paciente_afectado, ocurrido_at)
+    (actor_id, ocurrido_at)
+    ocurrido_at
+  }
+
+  Note: '''
+  Triggers AFTER en todas las tablas clínicas + registro explícito de
+  lecturas desde la aplicación.
+
+  Registrar también intento_denegado: los accesos rechazados son la
+  mejor señal temprana de abuso interno.
+
+  Append-only: revocar UPDATE y DELETE a todos los roles.
+  Conectar desde la PRIMERA entidad. Retrofitear auditoría significa
+  que los primeros meses de expediente no tienen trazabilidad, y eso
+  no se recupera.
+  '''
+}
+
+// ---------------------------------------------------------------------
+//  7. SOPORTE  (etapa 2, tablas previstas desde ahora)
+// ---------------------------------------------------------------------
+
+Table adjuntos {
+  id             uuid        [pk, default: `gen_random_uuid()`]
+  paciente_id    uuid        [not null]
+  consulta_id    uuid
+  subido_por     uuid
+  ambito         ambito_clinico [not null]
+  nombre_archivo text        [not null]
+  storage_key    text        [not null, note: 'Llave en R2. Servir SOLO con URL firmada de corta vigencia.']
+  mime_type      varchar(100)
+  tamano_bytes   bigint
+  hash_sha256    char(64)    [note: 'Integridad del documento clínico']
+  descripcion    text
+  fecha_estudio  date
+  created_at     timestamptz [not null, default: `now()`]
+  deleted_at     timestamptz
+
+  indexes {
+    (paciente_id, fecha_estudio)
+    consulta_id
+  }
+
+  Note: '''
+  Bucket privado siempre. Un bucket público con estudios de laboratorio
+  es la fuga más común en sistemas de salud pequeños.
+
+  Límite de Cloudflare: 100 MB por request en plan gratuito. Para
+  archivos pesados, subir directo a R2 con URL firmada desde el
+  navegador, sin pasar por el origen.
+  '''
+}
+
+Table planes_tratamiento {
+  id                    uuid        [pk, default: `gen_random_uuid()`]
+  paciente_id           uuid        [not null]
+  profesional_id        uuid        [not null]
+  especialidad_id       smallint    [not null]
+  consulta_origen_id    uuid
+  titulo                text        [not null]
+  objetivos             jsonb       [note: '[{ descripcion, metrica, valor_objetivo, fecha_meta, alcanzado }]']
+  indicaciones          jsonb       [note: 'Dieta, rutina, prescripción, tareas terapéuticas']
+  inicio                date        [not null]
+  fin                   date
+  activo                boolean     [not null, default: true]
+  visible_para_paciente boolean     [not null, default: true]
+  created_at            timestamptz [not null, default: `now()`]
+  updated_at            timestamptz [not null, default: `now()`]
+
+  indexes { (paciente_id, activo) }
+
+  Note: 'Permite que planes de distintas especialidades coexistan y que el sistema detecte conflictos (ej. déficit calórico agresivo junto a plan de fuerza en fase lútea).'
+}
+
+// =====================================================================
+//  RELACIONES DEL ESQUEMA DE TENANT
+//  (ninguna cruza al esquema public)
+// =====================================================================
+
+Ref: profesionales.usuario_id                     - usuarios.id
+Ref: pacientes.usuario_id                         - usuarios.id
+
+Ref: profesionales_especialidades.profesional_id  > profesionales.id [delete: cascade]
+Ref: profesionales_especialidades.especialidad_id > especialidades.id
+Ref: profesionales_especialidades.verificada_por  > profesionales.id
+
+Ref: antecedentes_generales.paciente_id           - pacientes.id [delete: cascade]
+Ref: antecedentes_ginecobstetricos.paciente_id    - pacientes.id [delete: cascade]
+Ref: registros_ciclo.paciente_id                  > pacientes.id [delete: cascade]
+
+Ref: plantillas_formulario.profesional_id         > profesionales.id [delete: cascade]
+Ref: plantillas_formulario.especialidad_id        > especialidades.id
+Ref: plantillas_formulario.version_actual_id      - plantilla_versiones.id
+Ref: plantilla_versiones.plantilla_id             > plantillas_formulario.id [delete: cascade]
+Ref: plantilla_versiones.publicada_por            > profesionales.id
+Ref: campos_definicion.plantilla_id               > plantillas_formulario.id [delete: cascade]
+
+Ref: citas.paciente_id                            > pacientes.id
+Ref: citas.profesional_id                         > profesionales.id
+Ref: citas.especialidad_id                        > especialidades.id
+
+Ref: consultas.cita_id                            - citas.id
+Ref: consultas.paciente_id                        > pacientes.id
+Ref: consultas.profesional_id                     > profesionales.id
+Ref: consultas.enmienda_de_id                     > consultas.id
+
+Ref: consulta_bloques.consulta_id                 > consultas.id [delete: cascade]
+Ref: consulta_bloques.especialidad_id             > especialidades.id
+Ref: consulta_bloques.profesional_id              > profesionales.id
+Ref: consulta_bloques.plantilla_version_id        > plantilla_versiones.id
+
+Ref: consentimientos_acceso.paciente_id           > pacientes.id [delete: cascade]
+Ref: consentimientos_acceso.profesional_id        > profesionales.id [delete: cascade]
+Ref: auditoria.paciente_afectado                  > pacientes.id
+
+Ref: adjuntos.paciente_id                         > pacientes.id
+Ref: adjuntos.consulta_id                         > consultas.id
+Ref: adjuntos.subido_por                          > profesionales.id
+Ref: planes_tratamiento.paciente_id               > pacientes.id
+Ref: planes_tratamiento.profesional_id            > profesionales.id
+Ref: planes_tratamiento.especialidad_id           > especialidades.id
+Ref: planes_tratamiento.consulta_origen_id        > consultas.id

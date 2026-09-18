@@ -92,16 +92,10 @@ Thumbs.db
 # Windows ADS metadata (WSL drvfs materializa el "Mark of the Web")
 *:Zone.Identifier
 
-# Config local de Claude Code — nunca al repo remoto
-CLAUDE.md
-.claude/
-
-# Documentación: se queda en local por defecto.
-# Solo se sube al remoto lo que se indique explícitamente (quitar la línea aquí).
-docs/
-PROMPT_SETUP_SIMPLE.md
-SETUP_SIMPLE.md
-red_sinosofica_schema.dbml
+# Reglas, documentación y skills SÍ se versionan: el proyecto se clona
+# completo en otros equipos y sin ellos no hay esquema, ni ADR, ni flujo.
+# Solo queda fuera lo que es específico de una máquina.
+.claude/settings.local.json
 
 # Docker
 .dockerignore

@@ -9,6 +9,14 @@ Diccionario de columnas y vocabulario. Decisión completa en
 
 1. **Append-only.** Nunca se edita ni se borra un renglón pasado. Si algo se
    revierte, se agrega un renglón de tipo `reversion`.
+   - **Única excepción: la columna `commit`.** El SHA solo existe después de
+     escribir el renglón, así que se completa justo después de commitear y
+     viaja en el commit siguiente. Ninguna otra columna se toca jamás.
+   - **Migración de formato.** Agregar una columna obliga a añadir el campo a
+     todos los renglones previos. Es formato, no contenido: ningún renglón
+     cambia de significado. La columna nueva va siempre **al final**, para no
+     correr los índices de campo que usan las consultas de abajo. Ocurrió una
+     vez, en la etapa 0.2, al agregar `referencia`.
 2. **Se escribe al cierre de cada etapa**, junto con el commit. Nunca en bloque
    al final de la fase: un log escrito de memoria es ficción.
 3. **Vocabulario cerrado.** Si hace falta un valor de `tipo` que no está en la
@@ -31,9 +39,14 @@ Diccionario de columnas y vocabulario. Decisión completa en
 | 9 | `ponytail` | `off` `lite` `full` `ultra` | Nivel activo al hacer el cambio |
 | 10 | `commit` | SHA corto (7) o vacío | Puente al historial de git |
 | 11 | `estado` | `hecho` `parcial` `bloqueado` `revertido` | Detectar lo que quedó a medias |
+| 12 | `referencia` | `ADR-006`, `spec/ciclo`, vacío | Puente al documento que justifica el renglón |
 
 `porque` es el campo que justifica el archivo entero. En seis meses vale más que
 el `qué`.
+
+`referencia` separa las dos escalas: `porque` cabe en una línea, y cuando la
+decisión no cabe en una línea, apunta al ADR que sí la desarrolla. Varias
+referencias se separan con punto y coma, nunca con coma.
 
 ---
 
@@ -73,6 +86,8 @@ punto y coma) · sin saltos de línea dentro de un campo.
 awk -F',' 'NF!=11 {print NR": "NF" campos"}' dev-log/dev_log.csv
 
 # Qué quedó sin cerrar
+# Ojo: por ser append-only, muestra TODO lo que alguna vez se bloqueó.
+# Leer hacia adelante para ver si un renglón posterior lo resolvió.
 grep -E ',(bloqueado|parcial)$' dev-log/dev_log.csv
 
 # Toda la deuda declarada
