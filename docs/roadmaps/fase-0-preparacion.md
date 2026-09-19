@@ -22,7 +22,7 @@ Plan maestro: Fases 0→6, alcance backend. Ver `docs/patron-entidad.md` y los A
 - [x] `feminist_net_back/dev-log/README.md` — diccionario de columnas
 - [x] `feminist_net_front/` **no** se crea hasta la Fase 7
 
-## Etapa 0.2 — Entorno local 🔶 parcial
+## Etapa 0.2 — Entorno local ✅
 
 - [x] `uv` 0.12.16 instalado en `~/.local/bin`
 - [x] Python 3.13.15 instalado por `uv`, en paralelo al 3.14.4 del sistema
@@ -30,41 +30,57 @@ Plan maestro: Fases 0→6, alcance backend. Ver `docs/patron-entidad.md` y los A
 - [x] git 2.53.0 — ya presente
 - [x] Versiones decididas: **Python 3.13 + Django 5.2 LTS** (ADR 006)
 - [x] Decisión de versionado: se versiona todo salvo `.claude/settings.local.json`
-- [ ] **Docker 24+ y Compose v2** — bloqueado, requiere `sudo` con contraseña
-- [ ] **Usuario en el grupo `docker`** — depende de lo anterior
+- [x] **Docker 29.8.0 y Compose v5.5.1** — vía Docker Desktop con integración WSL
+- [x] **Usuario en el grupo `docker`** — lo agregó Docker Desktop
+- [x] Imagen `postgres:16-alpine` descargada
 
-### Comandos pendientes de la 0.2
+### Cómo quedó Docker en este equipo
 
-Requieren contraseña, así que los ejecuta el usuario. Ubuntu 26.04 (`resolute`)
-ya trae versiones suficientes en sus propios repositorios: Docker 29.1.3 y
-Compose v2.40.3. **No hace falta agregar el repositorio de terceros de Docker**
-ni su llave GPG, que es el camino largo que casi toda guía recomienda.
+Se usó **Docker Desktop en Windows con integración WSL** activada para la distro
+`Ubuntu`. El motor corre en Linux (VM WSL2); solo la gestión es de Windows.
+
+> Docker Desktop → Settings → Resources → WSL Integration
+> → activar el interruptor general y marcar `Ubuntu` → Apply & Restart
+
+**Trampa:** la pertenencia a grupos se resuelve al crear la sesión. Docker
+Desktop agrega el usuario al grupo `docker`, pero una sesión de WSL ya abierta
+sigue con la lista vieja y el socket responde `permission denied`. Hay que hacer
+`wsl --shutdown` desde PowerShell y reabrir; cerrar la ventana no basta, porque
+WSL mantiene la distro viva en segundo plano.
+
+### Alternativa nativa, si en el otro equipo no hay Docker Desktop
+
+Ubuntu 26.04 (`resolute`) trae versiones suficientes en sus propios
+repositorios. **No hace falta el repositorio de terceros de Docker** ni su llave
+GPG, que es el camino largo que casi toda guía recomienda.
 
 ```bash
 sudo apt update
 sudo apt install -y docker.io docker-compose-v2 docker-buildx
-
-# Poder usar docker sin sudo
 sudo usermod -aG docker "$USER"
-
-# WSL2: arrancar el servicio
-sudo service docker start
+sudo systemctl enable --now docker   # este equipo tiene systemd=true en /etc/wsl.conf
 ```
 
-Después de `usermod`, **cerrar la sesión de WSL y volver a entrar** (`exit` y
-reabrir la terminal, o `wsl --shutdown` desde PowerShell). El grupo no se aplica
-a una sesión ya abierta.
+Luego `wsl --shutdown` y reabrir, por la misma razón de arriba.
 
-### Verificación de la 0.2
+Ventaja de la nativa: los contenedores corren en la **misma** distro, así que los
+bind mounts de la Etapa 1.6 (recarga en caliente) no cruzan entre distros.
+No mezclar ambas: si Docker Desktop tiene la integración activa, su atajo
+intercepta el comando `docker` y se acaba hablando con el motor equivocado.
 
-```bash
-docker --version           # >= 24
-docker compose version     # v2.x
-docker run --rm hello-world
-id -nG | tr ' ' '\n' | grep -qx docker && echo "grupo docker OK"
-uv --version
-uv python list --only-installed | grep 3.13
-node --version
+### Verificación de la 0.2 — resultado
+
+```
+docker             29.8.0        ✅ (mínimo 24)
+compose            5.5.1         ✅ v2+
+uv                 0.12.16       ✅
+python (uv)        3.13.15       ✅ el del proyecto
+python (sistema)   3.14.4        ✅ intacto
+node               v22.22.1      ✅ LTS
+git                2.53.0        ✅
+grupo docker       OK            ✅
+docker run hello-world           ✅
+postgres:16-alpine descargada    ✅
 ```
 
 ## Etapa 0.3 — Cuentas y dominio ⬜
